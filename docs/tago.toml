@@ -1,0 +1,10 @@
+title       = "lab"
+baseURL     = "https://gitlab-cli.tamnd.com/"
+description = "A command line for gitlab."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/gitlab-cli"
