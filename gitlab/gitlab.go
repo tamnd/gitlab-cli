@@ -1,62 +1,162 @@
 // Package gitlab is the library behind the lab command line:
-// the HTTP client, request shaping, and the typed data models for gitlab.
+// the HTTP client, request shaping, and the typed data models for the
+// GitLab REST API v4 (gitlab.com/api/v4).
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The public API requires no key for public projects and users. The Client
+// sets a polite User-Agent, paces requests to 1100ms apart (60 req/min limit),
+// and retries transient failures (429 and 5xx) with a capped backoff.
 package gitlab
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	neturl "net/url"
+	"strconv"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to gitlab. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "lab/dev (+https://github.com/tamnd/gitlab-cli)"
-
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at gitlab.com; change it once you
-// know the real endpoints you want to read.
+// Host is the GitLab API host.
 const Host = "gitlab.com"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
-
-// Client talks to gitlab over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds all tunable parameters for the Client.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+// DefaultConfig returns sensible defaults for the GitLab API.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://gitlab.com/api/v4",
+		UserAgent: "Mozilla/5.0 (compatible; gitlab-cli/dev; +https://github.com/tamnd/gitlab-cli)",
+		Rate:      1100 * time.Millisecond,
+		Timeout:   15 * time.Second,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to the GitLab API over HTTP.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	mu   sync.Mutex
+	last time.Time
+}
+
+// NewClient returns a Client configured with cfg.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// Search searches public projects by query string.
+func (c *Client) Search(ctx context.Context, query string, limit int) ([]Project, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	q := neturl.Values{}
+	q.Set("search", query)
+	q.Set("order_by", "stars_count")
+	q.Set("sort", "desc")
+	q.Set("per_page", strconv.Itoa(limit))
+	u := c.cfg.BaseURL + "/projects?" + q.Encode()
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var projects []Project
+	if err := json.Unmarshal(body, &projects); err != nil {
+		return nil, fmt.Errorf("decode projects: %w", err)
+	}
+	return projects, nil
+}
+
+// Project returns detail for one project by path (e.g. "gitlab-org/gitlab") or numeric id.
+func (c *Client) Project(ctx context.Context, path string) (*Project, error) {
+	encoded := neturl.PathEscape(path)
+	u := c.cfg.BaseURL + "/projects/" + encoded
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var p Project
+	if err := json.Unmarshal(body, &p); err != nil {
+		return nil, fmt.Errorf("decode project: %w", err)
+	}
+	return &p, nil
+}
+
+// Commits returns recent commits for a project path.
+func (c *Client) Commits(ctx context.Context, path string, limit int) ([]Commit, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	encoded := neturl.PathEscape(path)
+	q := neturl.Values{}
+	q.Set("per_page", strconv.Itoa(limit))
+	u := c.cfg.BaseURL + "/projects/" + encoded + "/repository/commits?" + q.Encode()
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var commits []Commit
+	if err := json.Unmarshal(body, &commits); err != nil {
+		return nil, fmt.Errorf("decode commits: %w", err)
+	}
+	return commits, nil
+}
+
+// Groups searches groups by name.
+func (c *Client) Groups(ctx context.Context, name string, limit int) ([]Group, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	q := neturl.Values{}
+	q.Set("search", name)
+	q.Set("per_page", strconv.Itoa(limit))
+	u := c.cfg.BaseURL + "/groups?" + q.Encode()
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var groups []Group
+	if err := json.Unmarshal(body, &groups); err != nil {
+		return nil, fmt.Errorf("decode groups: %w", err)
+	}
+	return groups, nil
+}
+
+// User finds a user by username. Returns the first match or an error if none found.
+func (c *Client) User(ctx context.Context, username string) (*User, error) {
+	q := neturl.Values{}
+	q.Set("username", username)
+	u := c.cfg.BaseURL + "/users?" + q.Encode()
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var users []User
+	if err := json.Unmarshal(body, &users); err != nil {
+		return nil, fmt.Errorf("decode users: %w", err)
+	}
+	if len(users) == 0 {
+		return nil, fmt.Errorf("user %q not found", username)
+	}
+	return &users[0], nil
+}
+
+func (c *Client) get(ctx context.Context, url string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -76,125 +176,93 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 	return nil, fmt.Errorf("get %s: %w", url, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
-
-	resp, err := c.HTTP.Do(req)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
-
 	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, err
-	}
-	return b, false, nil
+	return b, err != nil, err
 }
 
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
 }
 
 func backoff(attempt int) time.Duration {
-	d := time.Duration(attempt) * 500 * time.Millisecond
-	if d > 5*time.Second {
-		d = 5 * time.Second
-	}
-	return d
+	return min(time.Duration(attempt)*500*time.Millisecond, 5*time.Second)
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on gitlab.com. It is a stand-in for the typed records you
-// will model from the real gitlab endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `lab cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- record types ---
+
+// Project is one GitLab project.
+type Project struct {
+	ID            int    `json:"id"`
+	Path          string `json:"path_with_namespace"`
+	Name          string `json:"name"`
+	Description   string `json:"description,omitempty"`
+	Stars         int    `json:"star_count"`
+	Forks         int    `json:"forks_count"`
+	Visibility    string `json:"visibility"`
+	URL           string `json:"web_url"`
+	LastActivity  string `json:"last_activity_at,omitempty"`
+	OpenIssues    int    `json:"open_issues_count,omitempty"`
+	DefaultBranch string `json:"default_branch,omitempty"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+// Commit is one repository commit.
+type Commit struct {
+	ID          string `json:"id"`
+	ShortID     string `json:"short_id"`
+	Title       string `json:"title"`
+	AuthorName  string `json:"author_name"`
+	AuthorEmail string `json:"author_email,omitempty"`
+	CreatedAt   string `json:"created_at"`
+	Message     string `json:"message,omitempty"`
+	WebURL      string `json:"web_url,omitempty"`
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
+// Group is one GitLab group or organization.
+type Group struct {
+	ID          int    `json:"id"`
+	Name        string `json:"name"`
+	Path        string `json:"full_path"`
+	Description string `json:"description,omitempty"`
+	Visibility  string `json:"visibility"`
+	Stars       int    `json:"star_count,omitempty"`
+	WebURL      string `json:"web_url"`
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
+// User is one GitLab user.
+type User struct {
+	ID        int    `json:"id"`
+	Username  string `json:"username"`
+	Name      string `json:"name"`
+	State     string `json:"state,omitempty"`
+	AvatarURL string `json:"avatar_url,omitempty"`
+	WebURL    string `json:"web_url"`
+	Bio       string `json:"bio,omitempty"`
+	Location  string `json:"location,omitempty"`
 }
